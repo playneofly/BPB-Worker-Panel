@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import {
+  Activity,
   ClipboardPaste,
   Eye,
   EyeOff,
@@ -19,6 +20,7 @@ import {
   parseTemplate,
 } from "../lib/core";
 import { DEFAULT_CDN_DOMAINS, DEFAULT_CLEAN_IPS, HTTP_PORTS, TLS_PORTS } from "../lib/presets";
+import { canHttpProbe, ProbeResult, ScanStats, scanAddrs } from "../lib/probe";
 import { Reveal, SectionHead, easeOut } from "./ui";
 import { cn } from "../utils/cn";
 
@@ -57,6 +59,12 @@ export default function Multiplier({ onGenerated }: { onGenerated: (entries: Con
   const [target, setTarget] = useState(1000);
   const [showUid, setShowUid] = useState(false);
 
+  // اسکن حوض پیش از تولید
+  const [poolScan, setPoolScan] = useState<Record<string, ProbeResult>>({});
+  const [poolStats, setPoolStats] = useState<ScanStats | null>(null);
+  const [scanningPool, setScanningPool] = useState(false);
+  const [aliveOnly, setAliveOnly] = useState(false);
+
   const templates = useMemo(
     () =>
       templatesText
@@ -81,14 +89,38 @@ export default function Multiplier({ onGenerated }: { onGenerated: (entries: Con
     .filter(([, v]) => v)
     .map(([k]) => Number(k));
 
-  const potential = templates.length * pool.length * Math.max(activePorts.length, 0);
+  const scanKeys = Object.keys(poolScan);
+  const alivePool = useMemo(
+    () =>
+      scanKeys.length
+        ? pool
+            .filter((a) => poolScan[a]?.state === "ok")
+            .sort((a, b) => (poolScan[a]?.ms ?? 99999) - (poolScan[b]?.ms ?? 99999))
+        : [],
+    [pool, poolScan, scanKeys.length],
+  );
+  const genPool = aliveOnly && alivePool.length ? alivePool : pool;
+
+  const potential = templates.length * genPool.length * Math.max(activePorts.length, 0);
   const effective = Math.min(target, potential);
+
+  const startPoolScan = async () => {
+    if (!pool.length) return;
+    setScanningPool(true);
+    setPoolScan({});
+    setPoolStats({ total: pool.length, done: 0, ok: 0 });
+    await scanAddrs(pool, 3200, (r, st) => {
+      setPoolScan((m) => ({ ...m, [r.addr]: r }));
+      setPoolStats(st);
+    });
+    setScanningPool(false);
+  };
 
   const generate = () => {
     if (!templates.length || !pool.length || !activePorts.length) return;
     const out: ConfigEntry[] = [];
     let i = 0;
-    outer: for (const addr of pool) {
+    outer: for (const addr of genPool) {
       for (const port of activePorts) {
         const t = templates[i % templates.length];
         i++;
@@ -131,6 +163,42 @@ export default function Multiplier({ onGenerated }: { onGenerated: (entries: Con
           }
           desc="از پنل BPB خودت یک کانفیگ VLESS یا Trojan را کپی کن و در باکس الگو بگذار. تقویت‌کننده همان UUID و همان Host/SNI ورکر تو را نگه می‌دارد و فقط آدرس فیزیکی اتصال را بین IPهای تمیز و پورت‌های کلودفلر پخش می‌کند — دقیقاً همان کاری که فهرست «IP تمیز / آدرس CDN» در خودِ پنل BPB انجام می‌دهد، با حجم خیلی بیشتر."
         />
+
+        {/* zero-ping diagnosis banner */}
+        <Reveal>
+          <div className="mb-8 rounded-2xl border border-rose/25 bg-rose/7 p-5 md:p-6">
+            <h3 className="flex items-center gap-2 font-black text-rose">
+              <TriangleAlert className="size-5" />
+              «هیچ‌کدوم پینگ نداد»؟ سه دلیل دارد، به‌ترتیب احتمال:
+            </h3>
+            <ol className="mt-3 space-y-2.5 text-sm leading-7 text-fog">
+              <li className="flex gap-2.5">
+                <span className="font-mono font-bold text-rose shrink-0">۱)</span>
+                <span>
+                  <span className="font-extrabold text-white">ورکر BPB‌ات واقعاً بالا نیامده.</span> اگر الگویی که در باکس
+                  می‌گذاری به یک ورکرِ دیپلوی‌نشده اشاره کند، هر ۱٬۰۰۰ تا هم پینگ صفر می‌دهند — چون همه به یک سرور
+                  می‌روند. آدرس ورکر را در مرورگر باز کن؛ باید صفحه‌ی «فقط از طریق پنل BPB» یا همان‌پنل ببینی، نه خطا.
+                </span>
+              </li>
+              <li className="flex gap-2.5">
+                <span className="font-mono font-bold text-rose shrink-0">۲)</span>
+                <span>
+                  <span className="font-extrabold text-white">IPهای اجازه‌دار روی اپراتور تو می‌میرند.</span> فهرست‌های
+                  آماده روی شبکه‌ی هر اپراتور ممکن است عکس‌العمل متفاوتی داشته باشد — به همین خاطر دکمه‌ی «اسکن حوض»
+                  را پایین همین کارت گذاشتیم: از روی شبکه‌ی خودِ تو تست کن و با گزینه‌ی «فقط پاسخ‌دهنده‌ها» تولید کن.
+                </span>
+              </li>
+              <li className="flex gap-2.5">
+                <span className="font-mono font-bold text-rose shrink-0">۳)</span>
+                <span>
+                  <span className="font-extrabold text-white">ساب ذهنی کلاینت را با پینگ واقعی فیلتر نکردی.</span> بعد از
+                  ایمپورت در v2rayNG حتماً «Measure Latency» (تو آخیر واقعی) بگیر و فقط کانفیگ‌های زیرِ ۵۰۰ میلی‌ثانیه
+                  را نگه دار.
+                </span>
+              </li>
+            </ol>
+          </div>
+        </Reveal>
 
         <div className="grid gap-6 lg:grid-cols-[1.15fr_1fr]">
           {/* input side */}
@@ -241,8 +309,70 @@ export default function Multiplier({ onGenerated }: { onGenerated: (entries: Con
                   className="w-full rounded-xl border border-white/10 bg-black/35 px-4 py-3 font-mono text-left text-[11.5px] leading-6 text-white focus:border-mint/40 focus:outline-none"
                 />
                 <p className="mt-2 text-[11px] leading-5.5 text-fog/70">
-                  این فهرست فقط نقطه‌ی شروع است؛ هر هفته با اسکنر طرف‌حسابت یا ابزار «اسکنر IP تمیز» داخل پنل BPB به‌روزش کن.
+                  این فهرست ۴۸ IPِ «تست‌شده و زنده» است؛ ولی فهرستِ «خوبِ روی شبکه‌ی تو» فقط با اسکن زیر به‌دست می‌آید.
                 </p>
+
+                {/* pool scan controls */}
+                <div className="mt-3 space-y-2.5">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={startPoolScan}
+                      disabled={scanningPool || !pool.length}
+                      className="inline-flex cursor-pointer items-center gap-2 rounded-xl bg-gradient-to-l from-mint to-[#34d399] px-4 py-2.5 text-xs font-black text-ink transition-all hover:-translate-y-0.5 disabled:translate-y-0 disabled:opacity-35"
+                    >
+                      <Activity className={cn("size-4", scanningPool && "animate-pulse-soft")} />
+                      {scanningPool ? "در حال اسکن حوض…" : scanKeys.length ? "اسکن مجدد حوض" : "اسکن حوض با شبکه‌ی خودم"}
+                    </button>
+                    {poolStats && (
+                      <>
+                        <span className="rounded-lg bg-mint/12 px-2.5 py-1.5 text-[11px] font-bold text-mint">
+                          {faNum(poolStats.ok)} پاسخ‌داد از {faNum(poolStats.done)} / {faNum(poolStats.total)}
+                        </span>
+                        <div className="h-1.5 w-28 overflow-hidden rounded-full bg-white/8">
+                          <motion.div
+                            className="h-full rounded-full bg-mint"
+                            animate={{ width: `${(poolStats.done / Math.max(poolStats.total, 1)) * 100}%` }}
+                            transition={{ duration: 0.25 }}
+                          />
+                        </div>
+                      </>
+                    )}
+                  </div>
+
+                  {scanKeys.length > 0 && (
+                    <label className="flex cursor-pointer items-center justify-between gap-3 rounded-xl border border-mint/20 bg-mint/6 px-4 py-3">
+                      <span className="text-[12px] font-bold text-white">
+                        فقط از آدرس‌های پاسخ‌دهنده تولید کن
+                        <span className="mr-2 font-mono text-[10px] text-mint" dir="ltr">({faNum(alivePool.length)})</span>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setAliveOnly((v) => !v)}
+                        className={cn(
+                          "relative h-6 w-11 shrink-0 cursor-pointer rounded-full border transition-colors",
+                          aliveOnly ? "border-mint/40 bg-mint/25" : "border-white/15 bg-white/5",
+                        )}
+                      >
+                        <span
+                          className={cn(
+                            "absolute top-1/2 size-4 -translate-y-1/2 rounded-full transition-all",
+                            aliveOnly ? "right-1 bg-mint" : "right-6 bg-fog/50",
+                          )}
+                        />
+                      </button>
+                    </label>
+                  )}
+
+                  {!canHttpProbe() && (
+                    <p className="rounded-lg border border-cf/20 bg-cf/8 px-3 py-2 text-[11px] leading-5.5 text-cf-2">
+                      روی هاست HTTPS مرورگر اجازه‌ی پروب IP به پورت ۸۰ نمی‌دهد. برای اسکن واقعی IPها: این فایل را دانلود
+                      کن و با <code dir="ltr" className="rounded bg-black/30 px-1.5 py-0.5 font-mono">npx serve .</code> روی{" "}
+                      <code dir="ltr" className="rounded bg-black/30 px-1.5 py-0.5 font-mono">http://localhost:3000</code> بازش کن — آنجا
+                      اسکن کامل انجام می‌شود. دامنه‌های CDN روی HTTPS هم قابل تست‌اند.
+                    </p>
+                  )}
+                </div>
               </div>
             </Reveal>
           </div>
@@ -354,8 +484,10 @@ export default function Multiplier({ onGenerated }: { onGenerated: (entries: Con
                     <p className="mt-1 text-[10.5px] font-bold text-fog">الگو</p>
                   </div>
                   <div>
-                    <p className="font-mono text-2xl font-black text-white" dir="ltr">{faNum(pool.length)}</p>
-                    <p className="mt-1 text-[10.5px] font-bold text-fog">آدرس جایگزین</p>
+                    <p className="font-mono text-2xl font-black text-white" dir="ltr">{faNum(genPool.length)}</p>
+                    <p className="mt-1 text-[10.5px] font-bold text-fog">
+                      آدرس جایگزین{aliveOnly && genPool.length !== pool.length ? " (زنده)" : ""}
+                    </p>
                   </div>
                   <div>
                     <p className="font-mono text-2xl font-black text-white" dir="ltr">{faNum(activePorts.length)}</p>
